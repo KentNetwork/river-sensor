@@ -1,0 +1,675 @@
+//******************************************************************************
+// Copyright (c) 2019, Knox
+// Based on Laird's examples
+//
+// SPDX-License-Identifier:ISC
+//
+//
+// Description of this application:
+// This app monitors a distance and temperature periodically sends readings
+// Over a LoRaWAN network
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Jumpers: 1  2
+// 15 mins  X  X
+// 30 mins  -  X
+// 45 mins  X  -
+// 1 hour   -  -
+//******************************************************************************
+
+//******************************************************************************
+// Library Import
+//******************************************************************************
+#include "RM1xx-defs.h"
+
+//******************************************************************************
+// Definitions
+//******************************************************************************
+
+//Set this to 0 to disable all debugging messages
+#define ENABLE_DEBUG_PRINTS                  0
+
+//Set to 1 to automatically join the LoRa network at startup. Set 0 to disable it
+#define AUTO_JOIN       1
+
+//OTAA. To use ABP, replace the value with LORAMAC_JOIN_BY_PERSONALIZATION or 0
+#define JOIN_TYPE       LORAMAC_JOIN_BY_REQUEST
+
+//SIO17 is connected to jumper 1 and SIO03 is connected to jumper 2
+//These are used to set the transmission period
+#define JUMPER1         17
+#define JUMPER2         3
+
+//SIO5 is connected to enable distance
+#define ENABLE_SENSORS      4
+
+//SIO6 is connected to the sensor input
+#define DISTANCE_SENSOR_PIN    6
+
+// Number of local samples from ultrasonic per reading interval (for median)
+#define LOCAL_SAMPLES   9
+
+//********************************************************//
+// BLE Device Name
+//********************************************************//
+#define DEVICE_NAME          "Kent_Network_Sensor"
+#define DEVICE_NAME_CONFIG   "Config_Sensor"
+//********************************************************//
+
+//********************************************************//
+//--------------------------------------------------------//
+//********************************************************//
+// TX power
+// Required for both EddyStone (@0m)
+//========================================================//
+// Valid values: -90 to +8dBm in hexadecimal using a
+// 2's complement value for negative numbers
+// Example: +4dBm = 0x04
+//          -4dBm = 0xFC
+//********************************************************//
+#define TX_PWR_EDDY          0xFC
+//********************************************************//
+//--------------------------------------------------------//
+//********************************************************//
+// EddyStone Specific Settings
+//********************************************************//
+
+//Eddystone Service UUID
+#define EDDY_SVC_UUID        0xFEAA
+
+//EddyStone Frame Types
+#define UID                  0x00
+#define URL                  0x10
+#define TLM                  0x20
+#define EID                  0x30
+
+//EddyStone UID NameSpace
+//First 10 bytes SHA-1 Hash Conversion of 'kent.network'
+#define EDDY_NAMESPACE       "\83\0D\2F\8D\AF\9B\A2\B1\79\F0"
+
+//EddyStone UID Instance
+#define EDDY_INSTANCE        "\01\02\03\04\05\06"
+
+//********************************************************//
+//--------------------------------------------------------//
+//********************************************************//
+// AD Record Tags
+//********************************************************//
+#define FLAGS                0x01
+#define COMPLETE_LCL_NAME    0x09
+//16 bit Service Data is required for EddyStone
+#define SVC_DATA_16BIT       0x16
+//********************************************************//
+//--------------------------------------------------------//
+//********************************************************//
+// Advertisement Parameters
+//********************************************************//
+
+//Advert types
+#define ADV_IND              0
+#define ADV_DIRECT_IND       1
+#define ADV_SCAN_IND         2
+#define ADV_NONCONN_IND      3
+
+//Advert Type ADV_SCAN_IND
+//Could be ADV_NONCONN_IND if no scan reports are used
+//Could also be ADV_IND if connectable for configuration
+#define ADV_TYPE             ADV_NONCONN_IND
+
+//Advert Interval, time between successive Adverts
+#define ADV_INTVL            1000
+
+//********************************************************//
+//--------------------------------------------------------//
+//********************************************************//
+// Appearance of tag 512 == Generic tag
+//********************************************************//
+#define APPEARANCE           512
+//********************************************************//
+//--------------------------------------------------------//
+//********************************************************//
+// General Discoverability; Limited Discoverability == 1
+//********************************************************//
+#define DISCOVER_MODE        2
+//********************************************************//
+//--------------------------------------------------------//
+//********************************************************//
+// Connection values needed for GAP service regardless
+// of whether connectable or not
+//********************************************************//
+#define MIN_CONN_INTVL       15000
+#define MAX_CONN_INTVL       25000
+#define CONN_SUP_TIMEOUT     750000
+#define SLAVE_LATENCY        5
+//********************************************************//
+//--------------------------------------------------------//
+//********************************************************//
+// Device Information Service info
+//********************************************************//
+#define MANF_NAME            "Kent Network"
+#define MODEL                "Sensor"
+#define SERIAL_NUM           "C0EE4000010109E2"
+#define HW_REV               "1.0"
+#define APP_REV              "1.0"
+#define SYSID                ""
+#define REGLST               ""
+#define PPID                 ""
+
+//******************************************************************************
+// Register Error Handler as early as possible
+//******************************************************************************
+Sub HandlerOnErr()
+Endsub
+onerror next HandlerOnErr
+
+//******************************************************************************
+// Debugging resource as early as possible
+//******************************************************************************
+
+//==============================================================================
+Sub AssertResCode(byval rc as integer,byval tag as integer)
+    IF rc!=0 THEN
+    ENDIF
+Endsub
+
+//==============================================================================
+Sub DbgMsgVal(byval msg$ as string, byval vl as integer)
+    IF (ENABLE_DEBUG_PRINTS!=0) THEN
+    ENDIF
+Endsub
+
+//==============================================================================
+Sub DbgMsg(byval msg$ as string)
+    IF (ENABLE_DEBUG_PRINTS!=0) THEN
+    ENDIF
+Endsub
+
+
+//******************************************************************************
+// Debugging resource after libs
+//******************************************************************************
+
+//******************************************************************************
+// Global Variable Declarations
+//******************************************************************************
+
+dim rc
+dim str$                    //Store data for string
+
+dim okToTx : okToTx = 1     //Available duty cycle on one of sub-band (only matters in EU & AS)
+                            //Change to 0 at data Tx and 1 at EVLORAMACNEXTTX
+
+// Distance related variables
+dim distCircBuffer          // Circular buffer for distance readings
+dim maxEntries              // Max number of entries for circular buffers etc
+dim distanceToFloor : distanceToFloor = 0 // distance between sensor and river bed
+
+// BLE
+dim hMyChar,at$,conHndl
+dim bleConnectionState : bleConnectionState = 0
+
+//adRptE$ and scanRptE$ for EddyStone adverts
+dim adRptE$ : adRptE$ = ""
+dim scanRptE$ : scanRptE$ = ""
+
+//******************************************************************************
+// Function and Subroutine definitions
+//******************************************************************************
+
+//==============================================================================
+Sub EndianSwap(byref atm)
+    atm = (atm >> 8 & 0xFF) | (atm << 8 & 0xFF00)
+Endsub
+
+Function SwapBytes(v) As Integer
+Endfunc ((v>>8)&0xFF) + ((v<<8)&0xFF00)
+
+//==============================================================================
+// Read the state of a jumper
+//==============================================================================
+Function readJumper(byVal pinName) As Integer
+    //Setting jumper as Digial_IN with weak pull-up
+    rc = gpiosetfunc(pinName,1,0x02)
+    DIM jumperState
+    jumperState = GpioRead(pinName)
+    //Setting jumper as Digial_IN without weak pull-up
+    rc = gpiosetfunc(pinName,1,5)
+Endfunc jumperState
+
+//==============================================================================
+// Initialise and instantiate initial ble service, characteristic, start adverts
+//==============================================================================
+FUNCTION ConfigDeviceByBLE()
+    DIM rc, hSvc, adRpt$, addr$, scRpt$
+    DIM attr$
+    rc = NvRecordGetEx(1,attr$,"0")
+    //commit service
+    rc=BleSvcCommit(1,BleHandleUuid16(0x18EE),hSvc)
+    //initialise char, write/read enabled, accept signed writes
+    rc=BleCharNew(0x0A,BleHandleUuid16(1),BleAttrMetaData(1,1,20,0,rc),0,0)
+    //commit char initialised above, with initial value "hi" to service 'hSvc'
+    rc=BleCharCommit(hSvc,attr$,hMyChar)
+
+    rc=BleScanRptInit(scRpt$)
+    //Add 1 service handle to scan report
+    //rc=BleAdvRptAddUuid16(scRpt$,hSvc,-1,-1,-1,-1,-1)
+    //commit reports to GATT table - adRpt$ is empty
+    rc=BleAdvRptsCommit(adRpt$,scRpt$)
+    rc=BleAdvertStart(0,addr$,20,0,0)
+ENDFUNC rc
+
+Function EddyStone1$()
+//==============================================================================
+// Build EddyStone UID String
+//==============================================================================
+//----------------------------------------------------
+//Format:
+    // 0 1  2  3  4 5 6 7 8 9 0 1 2 3  4 5 6 7 8 9
+    // EddyStone_Svc_UUID
+    //      Frame_Type
+    //         TX_Power
+    //            EddyStone_Namespace
+    //                                 EddyStone_Instance
+    // AAFE 00 E2 A014C1898BD7AB0A56B0 010203040506
+//----------------------------------------------------
+    dim eddy1$, feddy1$
+
+    rc = BleEncode16(eddy1$,EDDY_SVC_UUID,0)
+    rc = BleEncode8(eddy1$,UID,2)
+    rc = BleEncode8(eddy1$,TX_PWR_EDDY,3)
+    feddy1$ = eddy1$ + EDDY_NAMESPACE + EDDY_INSTANCE
+endfunc feddy1$
+
+//==============================================================================
+// Transmit average river height over LoRaWAN network
+//==============================================================================
+Function LoraPost() As Integer
+    IF (okToTx == 1) THEN
+        //There is available duty cycle
+        dim sensorType$, sensorVal$,txData$, powerVal$
+        dim atm, theoreticalMax, actualMax
+
+        //Data format
+        sensorType$="\02\02"
+
+        // Find mean distance
+        DIM average,nItems,nData,i
+        average = 0
+        rc = CircBufItems(distCircBuffer,nItems)
+        IF rc == 0 THEN
+          FOR i = 1 TO nItems
+            rc = CircBufRead(distCircBuffer,nData)
+            IF rc == 0x5102 THEN
+              // The buffer was empty
+            ELSEIF rc != 0 THEN
+              // Failed to read from the circular buffer
+            ELSE
+              average = average + nData
+            ENDIF
+          NEXT
+       ENDIF
+      atm = average / nItems
+
+      EndianSwap(atm)
+      rc = BleEncode16(sensorVal$,atm,0)
+      txData$ = sensorType$ + sensorVal$
+      //Check the size of data is within maximum payload size
+      rc = LoramacQueryTxPossible(strlen(txData$), theoreticalMax, actualMax)
+      IF (rc == 0) THEN
+          //Current data rate can handle the outbound data size
+          rc = LORAMACTxData(2, txData$, 0)
+      ELSE
+          // Data payload is too large for current data rate"
+          //Increase data rate by one
+          rc = LORAMACGetOption(LORAMAC_OPT_DATA_RATE, str$)
+          dim dr : dr = StrValDec(str$)
+          IF (dr <= 4) then
+              dr = dr + 1
+              sprint #str$, dr
+              // Raising data rate for higher max payload
+          ENDIF
+          rc = LORAMACSetOption(LORAMAC_OPT_DATA_RATE, str$)
+      ENDIF
+    ELSE
+        // There is no available duty cycle
+        okToTx = 0  //Will become 1 when EVLORAMACNEXTTX is triggered
+    ENDIF
+Endfunc 1
+
+//==============================================================================
+// Subfunction to create a simple busy wait delay
+//==============================================================================
+Sub Delay(ms)
+ dim i : i = GetTickCount()
+ while GetTickSince(i)<ms
+ endwhile
+Endsub
+
+//==============================================================================
+// Subfunction to close BLE connections
+//==============================================================================
+SUB CloseConnections()
+    rc=BleDisconnect(conHndl)
+    rc=BleAdvertStop()
+ENDSUB
+
+//==============================================================================
+// Subfunction for BLE reg
+//==============================================================================
+Sub BLEEddyStartup()
+    rc = BleGapSvcInit(DEVICE_NAME,0,APPEARANCE,MIN_CONN_INTVL,MAX_CONN_INTVL,CONN_SUP_TIMEOUT,SLAVE_LATENCY)
+    rc = BleSvcRegDevInfo(MANF_NAME,MODEL,SERIAL_NUM,HW_REV,APP_REV,SYSID,REGLST,PPID)
+Endsub
+
+//==============================================================================
+// Subfunction for BLE advert creation
+//==============================================================================
+Sub BuildEddyAdverts()
+    dim EddyAD1$ : EddyAD1$ = EddyStone1$()
+    dim devname$ : devname$ = DEVICE_NAME
+
+    //Initialize adRptE$ and scanRptE$ for EddyStone
+    rc = BleAdvRptInit(adRptE$,DISCOVER_MODE,0,0)
+    rc = BleScanRptInit(scanRptE$)
+
+    //Build EddyStone Advert and Scan AD elements
+    rc = BleAdvRptAddUuid16(adRptE$,EDDY_SVC_UUID,-1,-1,-1,-1,-1)
+    rc = BleAdvRptAppendAD(adRptE$,SVC_DATA_16BIT,EddyAD1$)
+    rc = BleAdvRptAppendAD(scanRptE$,COMPLETE_LCL_NAME,devname$)
+Endsub
+
+//******************************************************************************
+// Handler definitions
+//******************************************************************************
+
+//==============================================================================
+// This handler is called when it is time to take a distance measurement
+//==============================================================================
+
+Function EnableSensors() As Integer
+  //Set up 10bit ADC for distance and temperature sensor
+  rc = gpiosetfunc(DISTANCE_SENSOR_PIN,3,0x13)
+  // Turn on sensors
+  gpiowrite(ENABLE_SENSORS,1)
+  // Start a 200 millisecond timer to allow things to stabilize
+  TimerStart(1,200,0)
+Endfunc 1
+
+//==============================================================================
+// This handler is called when the sensors are ready for a measurement
+//==============================================================================
+
+Function TakeSensorMeasurement() As Integer
+  dim localDistReadings(LOCAL_SAMPLES)       // array of local distance readings
+  // Get temperature
+
+  // Get temperature compensated distance
+  DIM i
+  FOR i=0 TO (LOCAL_SAMPLES-1) STEP 1
+    // conversion should happen here
+    // Dm = (Vm/(Vcc/1024)*(58e-6uS)) * (20.05*SQRT(Tc+273.15)/2)
+    localDistReadings[i] = GpioRead(DISTANCE_SENSOR_PIN)
+    Delay(10)
+  NEXT
+  gpiowrite(ENABLE_SENSORS,0)   //Turns Ultrasonic off
+
+  // Bubble sort
+  DIM j
+  DIM k
+  FOR j=0 TO j<(LOCAL_SAMPLES-1) STEP 1
+    FOR k=0 TO k<(LOCAL_SAMPLES-(j+1)) STEP 1
+      IF localDistReadings[k] > localDistReadings[k+1] THEN
+        dim t
+        t = localDistReadings[k]
+        localDistReadings[k] = localDistReadings[k+1]
+        localDistReadings[k+1] = t
+      ENDIF
+    NEXT
+  NEXT
+
+  // Find median
+  DIM medianDistance
+  IF LOCAL_SAMPLES % 2 == 0 THEN
+    medianDistance = (localDistReadings[(LOCAL_SAMPLES/2)-1]+localDistReadings[(LOCAL_SAMPLES/2)])/2
+  ELSE
+    medianDistance = localDistReadings[((LOCAL_SAMPLES-1)/2)]
+  ENDIF
+
+  // Store value in circular buffer
+  rc = CircBufOverwrite(distCircBuffer,medianDistance)
+  IF rc == 0x5103 THEN
+    // Oldest value was discarded to write new distance
+  ELSEIF rc !=0 THEN
+    // Failed to write into the circular buffer
+  ELSE
+    // Wrote into buffer
+  ENDIF
+
+  // Check to see if we have the required number of samples
+  dim nItems
+  rc = CircBufItems(distCircBuffer,nItems)
+
+  IF rc == 0 THEN
+    IF nItems == maxEntries THEN
+      rc = LoraPost()
+    ENDIF
+  ENDIF
+
+Endfunc 1
+
+//==============================================================================
+// Ble event handler
+//==============================================================================
+FUNCTION HndlrBleMsg(BYVAL nMsgId, BYVAL nCtx)
+    conHndl=nCtx
+    IF nMsgID==1 THEN
+        // Disconnected from client
+        bleConnectionState = 0
+        rc = ConfigDeviceByBLE()
+    ELSEIF nMsgID==0 THEN
+        // Connected to client
+        bleConnectionState = 1
+    ENDIF
+ENDFUNC 1
+
+//==============================================================================
+// New char value via BLE handler
+//==============================================================================
+FUNCTION HandlerCharVal(BYVAL charHandle, BYVAL offset, BYVAL len)
+    DIM s$
+    IF charHandle == hMyChar THEN
+        // Byte(s) have been written to char value attribute
+        rc=BleCharValueRead(hMyChar,s$)
+        rc = NvRecordSet(1,s$)
+        distanceToFloor = StrValDec(s$)
+    ENDIF
+ENDFUNC 1
+
+//==============================================================================
+// This handler is called when there is available duty cycle on one of sub-band to send data
+//==============================================================================
+Function HandlerNextTx() As Integer
+    okToTx = 1
+Endfunc 1
+
+//==============================================================================
+// This handler is called when there is a LoRa TX Complete event
+//==============================================================================
+Function HandlerLoRaTxComp() As Integer
+Endfunc 1
+
+//==============================================================================
+// This handler is called when there is a LoRa RX Complete event
+//==============================================================================
+Function HandlerLoRaRxComp() As Integer
+Endfunc 1
+
+//==============================================================================
+// This handler is called when the LoRa Join procedure starts
+//==============================================================================
+Function HandlerLoRaJoining() As Integer
+Endfunc 1
+
+//==============================================================================
+// This handler is called when there is a LoRa Join Success Complete event
+//==============================================================================
+Function HandlerLoRaJoined() As Integer
+    //Change data rate to DR2 to allow bigger payload
+    str$ = "2"
+    rc = LORAMACSetOption(LORAMAC_OPT_DATA_RATE, str$)
+    IF (AUTO_JOIN == 1) THEN
+        // Sample sensors every minute
+        TimerStart(0, 60000, 1)
+    ENDIF
+Endfunc 1
+
+//==============================================================================
+// This handler is called when there is a LoRa Join Fail event
+//==============================================================================
+Function HandlerLoRaJoinFailed() As Integer
+Endfunc 1
+
+//==============================================================================
+// This handler is called when there is a LoRa Tx Timeout event
+//==============================================================================
+Function HandlerLoRaTxTimeout() As Integer
+Endfunc 1
+
+//==============================================================================
+// This handler is called when there is a LoRa Rx Timeout event
+//==============================================================================
+Function HandlerLoRaRxTimeout() As Integer
+Endfunc 1
+
+//==============================================================================
+// This handler is called when there is an error in the receive path
+//==============================================================================
+Function HandlerLoRaRxError() As Integer
+Endfunc 1
+
+//==============================================================================
+// This handler is called when the TxDone signal has been received in the module
+//==============================================================================
+Function HandlerLoRaTxDone() As Integer
+Endfunc 1
+
+//==============================================================================
+// This handler is called an RxWindow has faied to receive a sync pulse
+//==============================================================================
+Function HandlerLoRaNoSync() As Integer
+Endfunc 1
+
+//==============================================================================
+// This handler is called when An ADR command has been receive as part of a downlink.
+//==============================================================================
+Function HandlerLoRaAdr(PacketType, FramePending) As Integer
+Endfunc 1
+
+//==============================================================================
+// This handler is called when ble adv times out
+//==============================================================================
+Function StartEddyAds() As Integer
+    dim peer$ : peer$ = ""
+    rc = BleAdvRptsCommit(adRptE$,scanRptE$)
+    rc = BleAdvertStart(ADV_TYPE,peer$,ADV_INTVL,0,0)
+Endfunc 1
+
+//==============================================================================
+// This handler is called when config via BLE times out
+//==============================================================================
+Function ConfigViaBleTimedOut() As Integer
+    IF bleConnectionState == 0 THEN
+      TimerCancel(2)
+      CloseConnections()
+      //  Begin eddystone beaconing
+      BLEEddyStartup()
+      BuildEddyAdverts()
+      rc = StartEddyAds()
+    ENDIF
+Endfunc 1
+
+//******************************************************************************
+// Equivalent to main() in C
+//******************************************************************************
+
+//==============================================================================
+// Enable synchronous event handlers
+//==============================================================================
+OnEvent  EVBLE_ADV_TIMEOUT    call  StartEddyAds
+ONEVENT  EVCHARVAL            call  HandlerCharVal
+ONEVENT  EVBLEMSG             call  HndlrBleMsg
+OnEvent  EVLORAMACTXCOMPLETE  call  HandlerLoRaTxComp
+OnEvent  EVLORAMACRXCOMPLETE  call  HandlerLoRaRxComp
+OnEvent  EVLORAMACJOINING     call  HandlerLoRaJoining
+OnEvent  EVLORAMACJOINED      call  HandlerLoRaJoined
+OnEvent  EVLORAMACJOINFAIL    call  HandlerLoRaJoinFailed
+OnEvent  EVLORAMACTXTIMEOUT   call  HandlerLoRaTxTimeout
+OnEvent  EVLORAMACRXTIMEOUT   call  HandlerLoRaRxTimeout
+OnEvent  EVLORAMACRXERROR     call  HandlerLoRaRxError
+OnEvent  EVLORAMACTXDONE      call  HandlerLoRaTxDone
+OnEvent  EVLORAMACNOSYNC      call  HandlerLoRaNoSync
+OnEvent  EVLORAMACADR         call  HandlerLoRaAdr
+OnEvent  EVLORAMACNEXTTX      call  HandlerNextTx
+
+OnEvent  EVTMR0               call  EnableSensors
+OnEvent  EVTMR1               call  TakeSensorMeasurement
+OnEvent  EVTMR2               call  ConfigViaBleTimedOut
+
+//==============================================================================
+// Set up GPIO and join LoRa network
+//==============================================================================
+Sub Initialise()
+
+    rc = gpiosetfunc(ENABLE_SENSORS,2,0)  // Puts sensors in 'off state'
+    uartclose()                           // Closes the UART
+
+    // Attempt to read sensor distance to floor bed from memory
+    dim distanceAsString$
+    rc = NvRecordGetEx(1,distanceAsString$,"0")
+    distanceToFloor = StrValDec(distanceAsString$)
+
+    // Start BLE service to allow device to be remotely configured
+    IF ConfigDeviceByBLE()==0 THEN
+      TimerStart(2, 60000, 1)
+    ELSE
+      STOP
+    ENDIF
+
+    //Read jumpers to set transmission interval
+    dim jumper1State
+    dim jumper2State
+    jumper1State = readJumper(JUMPER1)
+    jumper2State = readJumper(JUMPER2)
+
+    SELECT (jumper1State * 2) + jumper2State
+      CASE 0
+        maxEntries = 15
+      CASE 1
+      maxEntries = 30
+      CASE 2
+        maxEntries = 45
+      CASE 3
+        maxEntries = 60
+      CASE ELSE
+        maxEntries = 15
+    ENDSELECT
+
+    // Create buffer to store minute readings
+    rc = CircBufCreate(maxEntries,distCircBuffer)
+    IF rc!=0 THEN
+      // Failed to create buffer
+      STOP
+    ENDIF
+
+    //Automatically join the LoRaWAN network if set
+    IF (AUTO_JOIN == 1) THEN
+        rc = LORAMACJoin(JOIN_TYPE)
+    ENDIF
+
+
+Endsub
+
+Initialise()
+
+//Wait for a synchronous event.
+WaitEvent
