@@ -43,6 +43,9 @@
 //SIO5 is connected to enable distance
 #define ENABLE_SENSORS      4
 
+//SIO5 is connected TO the temperature input
+#define TEMP_SENSOR_PIN    5
+
 //SIO6 is connected to the sensor input
 #define DISTANCE_SENSOR_PIN    6
 
@@ -156,30 +159,30 @@
 #define PPID                 ""
 
 //******************************************************************************
-// Register Error Handler as early as possible
+// Register Error Handler AS early AS possible
 //******************************************************************************
 Sub HandlerOnErr()
 Endsub
 onerror next HandlerOnErr
 
 //******************************************************************************
-// Debugging resource as early as possible
+// Debugging resource AS early AS possible
 //******************************************************************************
 
 //==============================================================================
-Sub AssertResCode(byval rc as integer,byval tag as integer)
+Sub AssertResCode(byval rc AS integer,byval tag AS integer)
     IF rc!=0 THEN
     ENDIF
 Endsub
 
 //==============================================================================
-Sub DbgMsgVal(byval msg$ as string, byval vl as integer)
+Sub DbgMsgVal(byval msg$ AS string, byval vl AS integer)
     IF (ENABLE_DEBUG_PRINTS!=0) THEN
     ENDIF
 Endsub
 
 //==============================================================================
-Sub DbgMsg(byval msg$ as string)
+Sub DbgMsg(byval msg$ AS string)
     IF (ENABLE_DEBUG_PRINTS!=0) THEN
     ENDIF
 Endsub
@@ -193,24 +196,71 @@ Endsub
 // Global Variable Declarations
 //******************************************************************************
 
-dim rc
-dim str$                    //Store data for string
-
-dim okToTx : okToTx = 1     //Available duty cycle on one of sub-band (only matters in EU & AS)
+DIM rc
+DIM str$                    //Store data for string
+DIM transmitInterval : transmitInterval = 15
+DIM sleepCounter : sleepCounter = 0 // Creates an accurate long sleep
+DIM okToTx : okToTx = 1     //Available duty cycle on one of sub-band (only matters in EU & AS)
                             //Change to 0 at data Tx and 1 at EVLORAMACNEXTTX
 
 // Distance related variables
-dim distCircBuffer          // Circular buffer for distance readings
-dim maxEntries              // Max number of entries for circular buffers etc
-dim distanceToFloor : distanceToFloor = 0 // distance between sensor and river bed
+DIM distanceToFloor : distanceToFloor = 0 // distance between sensor and river bed
+DIM lookup[41] AS INTEGER
 
 // BLE
-dim hMyChar,at$,conHndl
-dim bleConnectionState : bleConnectionState = 0
+DIM hMyChar,at$,conHndl
+DIM bleConnectionState : bleConnectionState = 0
 
 //adRptE$ and scanRptE$ for EddyStone adverts
-dim adRptE$ : adRptE$ = ""
-dim scanRptE$ : scanRptE$ = ""
+DIM adRptE$ : adRptE$ = ""
+DIM scanRptE$ : scanRptE$ = ""
+
+//******************************************************************************
+// initialize Global Variable
+//******************************************************************************
+
+// Create lookup table FOR temperature compensation of distances
+lookup[0] = 19010
+lookup[1] = 19215
+lookup[2] = 19419
+lookup[3] = 19622
+lookup[4] = 19823
+lookup[5] = 20022
+lookup[6] = 20221
+lookup[7] = 20418
+lookup[8] = 20613
+lookup[9] = 20807
+lookup[10] = 21000
+lookup[11] = 21191
+lookup[12] = 21381
+lookup[13] = 21570
+lookup[14] = 21757
+lookup[15] = 21942
+lookup[16] = 22127
+lookup[17] = 22310
+lookup[18] = 22491
+lookup[19] = 22671
+lookup[20] = 22850
+lookup[21] = 23027
+lookup[22] = 23203
+lookup[23] = 23377
+lookup[24] = 23550
+lookup[25] = 23722
+lookup[26] = 23892
+lookup[27] = 24061
+lookup[28] = 24228
+lookup[29] = 24394
+lookup[30] = 24559
+lookup[31] = 24722
+lookup[32] = 24884
+lookup[33] = 25044
+lookup[34] = 25203
+lookup[35] = 25361
+lookup[36] = 25517
+lookup[37] = 25672
+lookup[38] = 25825
+lookup[39] = 25977
+lookup[40] = 26128
 
 //******************************************************************************
 // Function and Subroutine definitions
@@ -221,18 +271,82 @@ Sub EndianSwap(byref atm)
     atm = (atm >> 8 & 0xFF) | (atm << 8 & 0xFF00)
 Endsub
 
-Function SwapBytes(v) As Integer
+Function SwapBytes(v) AS Integer
 Endfunc ((v>>8)&0xFF) + ((v<<8)&0xFF00)
+
+//==============================================================================
+// Subfunction to create a simple busy wait delay
+//==============================================================================
+Sub Delay(ms)
+ DIM i : i = GetTickCount()
+ WHILE GetTickSince(i)<ms
+ ENDWHILE
+Endsub
+
+//==============================================================================
+// Subfunction to close BLE connections
+//==============================================================================
+SUB CloseConnections()
+    rc=BleDisconnect(conHndl)
+    rc=BleAdvertStop()
+Endsub
+
+//==============================================================================
+// Subfunction for BLE reg
+//==============================================================================
+Sub BLEEddyStartup()
+    rc = BleGapSvcInit(DEVICE_NAME,0,APPEARANCE,MIN_CONN_INTVL,MAX_CONN_INTVL,CONN_SUP_TIMEOUT,SLAVE_LATENCY)
+    rc = BleSvcRegDevInfo(MANF_NAME,MODEL,SERIAL_NUM,HW_REV,APP_REV,SYSID,REGLST,PPID)
+Endsub
+
+Function EddyStone1$()
+//==============================================================================
+// Build EddyStone UID String
+//==============================================================================
+//----------------------------------------------------
+//Format:
+    // 0 1  2  3  4 5 6 7 8 9 0 1 2 3  4 5 6 7 8 9
+    // EddyStone_Svc_UUID
+    //      Frame_Type
+    //         TX_Power
+    //            EddyStone_Namespace
+    //                                 EddyStone_Instance
+    // AAFE 00 E2 A014C1898BD7AB0A56B0 010203040506
+//----------------------------------------------------
+    DIM eddy1$, feddy1$
+
+    rc = BleEncode16(eddy1$,EDDY_SVC_UUID,0)
+    rc = BleEncode8(eddy1$,UID,2)
+    rc = BleEncode8(eddy1$,TX_PWR_EDDY,3)
+    feddy1$ = eddy1$ + EDDY_NAMESPACE + EDDY_INSTANCE
+Endfunc feddy1$
+
+//==============================================================================
+// Subfunction for BLE advert creation
+//==============================================================================
+Sub BuildEddyAdverts()
+    DIM EddyAD1$ : EddyAD1$ = EddyStone1$()
+    DIM devname$ : devname$ = DEVICE_NAME
+
+    //Initialize adRptE$ and scanRptE$ for EddyStone
+    rc = BleAdvRptInit(adRptE$,DISCOVER_MODE,0,0)
+    rc = BleScanRptInit(scanRptE$)
+
+    //Build EddyStone Advert and Scan AD elements
+    rc = BleAdvRptAddUuid16(adRptE$,EDDY_SVC_UUID,-1,-1,-1,-1,-1)
+    rc = BleAdvRptAppendAD(adRptE$,SVC_DATA_16BIT,EddyAD1$)
+    rc = BleAdvRptAppendAD(scanRptE$,COMPLETE_LCL_NAME,devname$)
+Endsub
 
 //==============================================================================
 // Read the state of a jumper
 //==============================================================================
-Function readJumper(byVal pinName) As Integer
-    //Setting jumper as Digial_IN with weak pull-up
+Function readJumper(byVal pinName) AS Integer
+    //Setting jumper AS Digial_IN with weak pull-up
     rc = gpiosetfunc(pinName,1,0x02)
     DIM jumperState
     jumperState = GpioRead(pinName)
-    //Setting jumper as Digial_IN without weak pull-up
+    //Setting jumper AS Digial_IN without weak pull-up
     rc = gpiosetfunc(pinName,1,5)
 Endfunc jumperState
 
@@ -258,71 +372,127 @@ FUNCTION ConfigDeviceByBLE()
     rc=BleAdvertStart(0,addr$,20,0,0)
 ENDFUNC rc
 
-Function EddyStone1$()
 //==============================================================================
-// Build EddyStone UID String
+// Read temperature sensor
 //==============================================================================
-//----------------------------------------------------
-//Format:
-    // 0 1  2  3  4 5 6 7 8 9 0 1 2 3  4 5 6 7 8 9
-    // EddyStone_Svc_UUID
-    //      Frame_Type
-    //         TX_Power
-    //            EddyStone_Namespace
-    //                                 EddyStone_Instance
-    // AAFE 00 E2 A014C1898BD7AB0A56B0 010203040506
-//----------------------------------------------------
-    dim eddy1$, feddy1$
+Function ReadTemp()
 
-    rc = BleEncode16(eddy1$,EDDY_SVC_UUID,0)
-    rc = BleEncode8(eddy1$,UID,2)
-    rc = BleEncode8(eddy1$,TX_PWR_EDDY,3)
-    feddy1$ = eddy1$ + EDDY_NAMESPACE + EDDY_INSTANCE
-endfunc feddy1$
+    DIM rawRead
+    DIM tempC
+    DIM localReadings(LOCAL_SAMPLES)        // array of local temperature readings
+    DIM i
+    FOR i=0 TO (LOCAL_SAMPLES-1) STEP 1
+      localReadings[i] = GpioRead(TEMP_SENSOR_PIN)
+    NEXT
+
+    // Bubble sort
+    DIM j
+    DIM k
+    FOR j=0 TO j<(LOCAL_SAMPLES-1) STEP 1
+      FOR k=0 TO k<(LOCAL_SAMPLES-(j+1)) STEP 1
+        IF localReadings[k] > localReadings[k+1] THEN
+          DIM t
+          t = localReadings[k]
+          localReadings[k] = localReadings[k+1]
+          localReadings[k+1] = t
+        ENDIF
+      NEXT
+    NEXT
+
+   // Find median
+   IF LOCAL_SAMPLES % 2 == 0 THEN
+    rawRead = (localReadings[(LOCAL_SAMPLES/2)-1]+localReadings[(LOCAL_SAMPLES/2)])/2
+    ELSE
+    rawRead = localReadings[((LOCAL_SAMPLES-1)/2)]
+   ENDIF
+
+   tempC = (((rawRead * 10)- 7486)*((rawRead *10) + 117331)) / -4722260
+
+Endfunc tempC
+
+//==============================================================================
+// Read ultrasonic sensor
+//==============================================================================
+Function ReadDistance()
+
+  DIM distanceCM
+  DIM localReadings(LOCAL_SAMPLES)        // array of local distance readings
+  DIM i
+  FOR i=0 TO (LOCAL_SAMPLES-1) STEP 1
+    localReadings[i] = GpioRead(DISTANCE_SENSOR_PIN)
+    // XL reading happens at 10-Hz rate.
+    Delay(100)
+  NEXT
+
+  // Bubble sort
+  DIM j
+  DIM k
+  FOR j=0 TO j<(LOCAL_SAMPLES-1) STEP 1
+    FOR k=0 TO k<(LOCAL_SAMPLES-(j+1)) STEP 1
+      IF localReadings[k] > localReadings[k+1] THEN
+        DIM t
+        t = localReadings[k]
+        localReadings[k] = localReadings[k+1]
+        localReadings[k+1] = t
+      ENDIF
+    NEXT
+  NEXT
+
+  // Find median
+  IF LOCAL_SAMPLES % 2 == 0 THEN
+  distanceCM = (localReadings[(LOCAL_SAMPLES/2)-1]+localReadings[(LOCAL_SAMPLES/2)])/2
+  ELSE
+  distanceCM = localReadings[((LOCAL_SAMPLES-1)/2)]
+  ENDIF
+
+Endfunc distanceCM
 
 //==============================================================================
 // Transmit average river height over LoRaWAN network
 //==============================================================================
-Function LoraPost() As Integer
+Function LoraPost() AS Integer
     IF (okToTx == 1) THEN
-        //There is available duty cycle
-        dim sensorType$, sensorVal$,txData$, powerVal$
-        dim atm, theoreticalMax, actualMax
+      //There is available duty cycle
+      DIM rawDistType$, rawDistVal$, tempType$, tempVal$, compDistType$, compDistVal$, txData$
+      DIM atm, theoreticalMax, actualMax
 
-        //Data format
-        sensorType$="\02\02"
+      //Data format
+      rawDistType$="\02\02"
+      tempType$="\02\02"
+      compDistType$="\02\02"
 
-        // Find mean distance
-        DIM average,nItems,nData,i
-        average = 0
-        rc = CircBufItems(distCircBuffer,nItems)
-        IF rc == 0 THEN
-          FOR i = 1 TO nItems
-            rc = CircBufRead(distCircBuffer,nData)
-            IF rc == 0x5102 THEN
-              // The buffer was empty
-            ELSEIF rc != 0 THEN
-              // Failed to read from the circular buffer
-            ELSE
-              average = average + nData
-            ENDIF
-          NEXT
-       ENDIF
-      atm = average / nItems
+      DIM temperatureC
+      DIM rawDistanceCM
+      DIM tempCompensatedDistance
 
-      EndianSwap(atm)
-      rc = BleEncode16(sensorVal$,atm,0)
-      txData$ = sensorType$ + sensorVal$
+      temperatureC = ReadTemp()
+      rawDistanceCM = ReadDistance()
+      rc = gpiosetfunc(ENABLE_SENSORS,2,0)  // Puts sensors back into 'off state'
+
+      tempCompensatedDistance = (rawDistanceCM*(lookup[(temperatureC/5)+10] + (35*(temperatureC%5))))/20000
+
+      // Create payload
+      EndianSwap(rawDistanceCM)
+      rc = BleEncode16(rawDistVal$,rawDistanceCM,0)
+
+      EndianSwap(temperatureC)
+      rc = BleEncode16(tempVal$,temperatureC,0)
+
+      EndianSwap(tempCompensatedDistance)
+      rc = BleEncode16(compDistVal$,tempCompensatedDistance,0)
+
+      txData$ = rawDistType$ + rawDistVal$ + tempType$ + tempVal$ + compDistType$ + compDistVal$
+
       //Check the size of data is within maximum payload size
       rc = LoramacQueryTxPossible(strlen(txData$), theoreticalMax, actualMax)
       IF (rc == 0) THEN
           //Current data rate can handle the outbound data size
-          rc = LORAMACTxData(2, txData$, 0)
+          rc = LORAMACTxData(3, txData$, 0)
       ELSE
           // Data payload is too large for current data rate"
           //Increase data rate by one
           rc = LORAMACGetOption(LORAMAC_OPT_DATA_RATE, str$)
-          dim dr : dr = StrValDec(str$)
+          DIM dr : dr = StrValDec(str$)
           IF (dr <= 4) then
               dr = dr + 1
               sprint #str$, dr
@@ -336,48 +506,6 @@ Function LoraPost() As Integer
     ENDIF
 Endfunc 1
 
-//==============================================================================
-// Subfunction to create a simple busy wait delay
-//==============================================================================
-Sub Delay(ms)
- dim i : i = GetTickCount()
- while GetTickSince(i)<ms
- endwhile
-Endsub
-
-//==============================================================================
-// Subfunction to close BLE connections
-//==============================================================================
-SUB CloseConnections()
-    rc=BleDisconnect(conHndl)
-    rc=BleAdvertStop()
-ENDSUB
-
-//==============================================================================
-// Subfunction for BLE reg
-//==============================================================================
-Sub BLEEddyStartup()
-    rc = BleGapSvcInit(DEVICE_NAME,0,APPEARANCE,MIN_CONN_INTVL,MAX_CONN_INTVL,CONN_SUP_TIMEOUT,SLAVE_LATENCY)
-    rc = BleSvcRegDevInfo(MANF_NAME,MODEL,SERIAL_NUM,HW_REV,APP_REV,SYSID,REGLST,PPID)
-Endsub
-
-//==============================================================================
-// Subfunction for BLE advert creation
-//==============================================================================
-Sub BuildEddyAdverts()
-    dim EddyAD1$ : EddyAD1$ = EddyStone1$()
-    dim devname$ : devname$ = DEVICE_NAME
-
-    //Initialize adRptE$ and scanRptE$ for EddyStone
-    rc = BleAdvRptInit(adRptE$,DISCOVER_MODE,0,0)
-    rc = BleScanRptInit(scanRptE$)
-
-    //Build EddyStone Advert and Scan AD elements
-    rc = BleAdvRptAddUuid16(adRptE$,EDDY_SVC_UUID,-1,-1,-1,-1,-1)
-    rc = BleAdvRptAppendAD(adRptE$,SVC_DATA_16BIT,EddyAD1$)
-    rc = BleAdvRptAppendAD(scanRptE$,COMPLETE_LCL_NAME,devname$)
-Endsub
-
 //******************************************************************************
 // Handler definitions
 //******************************************************************************
@@ -386,9 +514,7 @@ Endsub
 // This handler is called when it is time to take a distance measurement
 //==============================================================================
 
-Function EnableSensors() As Integer
-  //Set up 10bit ADC for distance and temperature sensor
-  rc = gpiosetfunc(DISTANCE_SENSOR_PIN,3,0x13)
+Function EnableSensors() AS Integer
   // Turn on sensors
   gpiowrite(ENABLE_SENSORS,1)
   // Start a 200 millisecond timer to allow things to stabilize
@@ -396,63 +522,16 @@ Function EnableSensors() As Integer
 Endfunc 1
 
 //==============================================================================
-// This handler is called when the sensors are ready for a measurement
+// This handler is called to create a long sleep
 //==============================================================================
 
-Function TakeSensorMeasurement() As Integer
-  dim localDistReadings(LOCAL_SAMPLES)       // array of local distance readings
-  // Get temperature
+Function LongSleep() AS Integer
 
-  // Get temperature compensated distance
-  DIM i
-  FOR i=0 TO (LOCAL_SAMPLES-1) STEP 1
-    // conversion should happen here
-    // Dm = (Vm/(Vcc/1024)*(58e-6uS)) * (20.05*SQRT(Tc+273.15)/2)
-    localDistReadings[i] = GpioRead(DISTANCE_SENSOR_PIN)
-    Delay(10)
-  NEXT
-  gpiowrite(ENABLE_SENSORS,0)   //Turns Ultrasonic off
-
-  // Bubble sort
-  DIM j
-  DIM k
-  FOR j=0 TO j<(LOCAL_SAMPLES-1) STEP 1
-    FOR k=0 TO k<(LOCAL_SAMPLES-(j+1)) STEP 1
-      IF localDistReadings[k] > localDistReadings[k+1] THEN
-        dim t
-        t = localDistReadings[k]
-        localDistReadings[k] = localDistReadings[k+1]
-        localDistReadings[k+1] = t
-      ENDIF
-    NEXT
-  NEXT
-
-  // Find median
-  DIM medianDistance
-  IF LOCAL_SAMPLES % 2 == 0 THEN
-    medianDistance = (localDistReadings[(LOCAL_SAMPLES/2)-1]+localDistReadings[(LOCAL_SAMPLES/2)])/2
+  IF sleepCounter == transmitInterval - 1 THEN
+    sleepCounter = 0
+    rc = EnableSensors()
   ELSE
-    medianDistance = localDistReadings[((LOCAL_SAMPLES-1)/2)]
-  ENDIF
-
-  // Store value in circular buffer
-  rc = CircBufOverwrite(distCircBuffer,medianDistance)
-  IF rc == 0x5103 THEN
-    // Oldest value was discarded to write new distance
-  ELSEIF rc !=0 THEN
-    // Failed to write into the circular buffer
-  ELSE
-    // Wrote into buffer
-  ENDIF
-
-  // Check to see if we have the required number of samples
-  dim nItems
-  rc = CircBufItems(distCircBuffer,nItems)
-
-  IF rc == 0 THEN
-    IF nItems == maxEntries THEN
-      rc = LoraPost()
-    ENDIF
+    sleepCounter = sleepCounter + 1
   ENDIF
 
 Endfunc 1
@@ -488,32 +567,32 @@ ENDFUNC 1
 //==============================================================================
 // This handler is called when there is available duty cycle on one of sub-band to send data
 //==============================================================================
-Function HandlerNextTx() As Integer
+Function HandlerNextTx() AS Integer
     okToTx = 1
 Endfunc 1
 
 //==============================================================================
 // This handler is called when there is a LoRa TX Complete event
 //==============================================================================
-Function HandlerLoRaTxComp() As Integer
+Function HandlerLoRaTxComp() AS Integer
 Endfunc 1
 
 //==============================================================================
 // This handler is called when there is a LoRa RX Complete event
 //==============================================================================
-Function HandlerLoRaRxComp() As Integer
+Function HandlerLoRaRxComp() AS Integer
 Endfunc 1
 
 //==============================================================================
 // This handler is called when the LoRa Join procedure starts
 //==============================================================================
-Function HandlerLoRaJoining() As Integer
+Function HandlerLoRaJoining() AS Integer
 Endfunc 1
 
 //==============================================================================
 // This handler is called when there is a LoRa Join Success Complete event
 //==============================================================================
-Function HandlerLoRaJoined() As Integer
+Function HandlerLoRaJoined() AS Integer
     //Change data rate to DR2 to allow bigger payload
     str$ = "2"
     rc = LORAMACSetOption(LORAMAC_OPT_DATA_RATE, str$)
@@ -526,50 +605,50 @@ Endfunc 1
 //==============================================================================
 // This handler is called when there is a LoRa Join Fail event
 //==============================================================================
-Function HandlerLoRaJoinFailed() As Integer
+Function HandlerLoRaJoinFailed() AS Integer
 Endfunc 1
 
 //==============================================================================
 // This handler is called when there is a LoRa Tx Timeout event
 //==============================================================================
-Function HandlerLoRaTxTimeout() As Integer
+Function HandlerLoRaTxTimeout() AS Integer
 Endfunc 1
 
 //==============================================================================
 // This handler is called when there is a LoRa Rx Timeout event
 //==============================================================================
-Function HandlerLoRaRxTimeout() As Integer
+Function HandlerLoRaRxTimeout() AS Integer
 Endfunc 1
 
 //==============================================================================
 // This handler is called when there is an error in the receive path
 //==============================================================================
-Function HandlerLoRaRxError() As Integer
+Function HandlerLoRaRxError() AS Integer
 Endfunc 1
 
 //==============================================================================
 // This handler is called when the TxDone signal has been received in the module
 //==============================================================================
-Function HandlerLoRaTxDone() As Integer
+Function HandlerLoRaTxDone() AS Integer
 Endfunc 1
 
 //==============================================================================
 // This handler is called an RxWindow has faied to receive a sync pulse
 //==============================================================================
-Function HandlerLoRaNoSync() As Integer
+Function HandlerLoRaNoSync() AS Integer
 Endfunc 1
 
 //==============================================================================
-// This handler is called when An ADR command has been receive as part of a downlink.
+// This handler is called when An ADR command has been receive AS part of a downlink.
 //==============================================================================
-Function HandlerLoRaAdr(PacketType, FramePending) As Integer
+Function HandlerLoRaAdr(PacketType, FramePending) AS Integer
 Endfunc 1
 
 //==============================================================================
 // This handler is called when ble adv times out
 //==============================================================================
-Function StartEddyAds() As Integer
-    dim peer$ : peer$ = ""
+Function StartEddyAds() AS Integer
+    DIM peer$ : peer$ = ""
     rc = BleAdvRptsCommit(adRptE$,scanRptE$)
     rc = BleAdvertStart(ADV_TYPE,peer$,ADV_INTVL,0,0)
 Endfunc 1
@@ -577,7 +656,7 @@ Endfunc 1
 //==============================================================================
 // This handler is called when config via BLE times out
 //==============================================================================
-Function ConfigViaBleTimedOut() As Integer
+Function ConfigViaBleTimedOut() AS Integer
     IF bleConnectionState == 0 THEN
       TimerCancel(2)
       CloseConnections()
@@ -611,8 +690,8 @@ OnEvent  EVLORAMACNOSYNC      call  HandlerLoRaNoSync
 OnEvent  EVLORAMACADR         call  HandlerLoRaAdr
 OnEvent  EVLORAMACNEXTTX      call  HandlerNextTx
 
-OnEvent  EVTMR0               call  EnableSensors
-OnEvent  EVTMR1               call  TakeSensorMeasurement
+OnEvent  EVTMR0               call  LongSleep
+OnEvent  EVTMR1               call  LoraPost
 OnEvent  EVTMR2               call  ConfigViaBleTimedOut
 
 //==============================================================================
@@ -623,8 +702,13 @@ Sub Initialise()
     rc = gpiosetfunc(ENABLE_SENSORS,2,0)  // Puts sensors in 'off state'
     uartclose()                           // Closes the UART
 
+    //
+    //Set up 10bit ADC with 1/3 prescaler FOR distance and temperature sensor
+    rc = gpiosetfunc(DISTANCE_SENSOR_PIN,3,0x13)
+    rc = gpiosetfunc(TEMP_SENSOR_PIN,3,0x13)
+
     // Attempt to read sensor distance to floor bed from memory
-    dim distanceAsString$
+    DIM distanceAsString$
     rc = NvRecordGetEx(1,distanceAsString$,"0")
     distanceToFloor = StrValDec(distanceAsString$)
 
@@ -636,30 +720,23 @@ Sub Initialise()
     ENDIF
 
     //Read jumpers to set transmission interval
-    dim jumper1State
-    dim jumper2State
+    DIM jumper1State
+    DIM jumper2State
     jumper1State = readJumper(JUMPER1)
     jumper2State = readJumper(JUMPER2)
 
     SELECT (jumper1State * 2) + jumper2State
       CASE 0
-        maxEntries = 15
+        transmitInterval = 15
       CASE 1
-      maxEntries = 30
+        transmitInterval = 30
       CASE 2
-        maxEntries = 45
+        transmitInterval = 45
       CASE 3
-        maxEntries = 60
+        transmitInterval = 60
       CASE ELSE
-        maxEntries = 15
+        transmitInterval = 15
     ENDSELECT
-
-    // Create buffer to store minute readings
-    rc = CircBufCreate(maxEntries,distCircBuffer)
-    IF rc!=0 THEN
-      // Failed to create buffer
-      STOP
-    ENDIF
 
     //Automatically join the LoRaWAN network if set
     IF (AUTO_JOIN == 1) THEN
