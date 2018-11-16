@@ -26,6 +26,9 @@
 // Definitions
 //******************************************************************************
 
+// Which maxbotix sensor is in use? MB7060 or MB7389
+#define MB7060 1
+
 //Set this to 0 to disable all debugging messages
 #define ENABLE_DEBUG_PRINTS                  0
 
@@ -43,14 +46,14 @@
 //SIO5 is connected to enable distance
 #define ENABLE_SENSORS      4
 
-//SIO5 is connected TO the temperature input
+//SIO5 is connected to the temperature input (not used)
 #define TEMP_SENSOR_PIN    5
 
 //SIO6 is connected to the sensor input
 #define DISTANCE_SENSOR_PIN    6
 
 // Number of local samples from ultrasonic per reading interval (for median)
-#define LOCAL_SAMPLES   9
+#define LOCAL_SAMPLES   5
 
 //********************************************************//
 // BLE Device Name
@@ -205,7 +208,6 @@ DIM okToTx : okToTx = 1     //Available duty cycle on one of sub-band (only matt
 
 // Distance related variables
 DIM distanceToFloor : distanceToFloor = 0 // distance between sensor and river bed
-DIM lookup[41] AS INTEGER
 
 // BLE
 DIM hMyChar,at$,conHndl
@@ -214,53 +216,7 @@ DIM bleConnectionState : bleConnectionState = 0
 //adRptE$ and scanRptE$ for EddyStone adverts
 DIM adRptE$ : adRptE$ = ""
 DIM scanRptE$ : scanRptE$ = ""
-
-//******************************************************************************
-// initialize Global Variable
-//******************************************************************************
-
-// Create lookup table FOR temperature compensation of distances
-lookup[0] = 19010
-lookup[1] = 19215
-lookup[2] = 19419
-lookup[3] = 19622
-lookup[4] = 19823
-lookup[5] = 20022
-lookup[6] = 20221
-lookup[7] = 20418
-lookup[8] = 20613
-lookup[9] = 20807
-lookup[10] = 21000
-lookup[11] = 21191
-lookup[12] = 21381
-lookup[13] = 21570
-lookup[14] = 21757
-lookup[15] = 21942
-lookup[16] = 22127
-lookup[17] = 22310
-lookup[18] = 22491
-lookup[19] = 22671
-lookup[20] = 22850
-lookup[21] = 23027
-lookup[22] = 23203
-lookup[23] = 23377
-lookup[24] = 23550
-lookup[25] = 23722
-lookup[26] = 23892
-lookup[27] = 24061
-lookup[28] = 24228
-lookup[29] = 24394
-lookup[30] = 24559
-lookup[31] = 24722
-lookup[32] = 24884
-lookup[33] = 25044
-lookup[34] = 25203
-lookup[35] = 25361
-lookup[36] = 25517
-lookup[37] = 25672
-lookup[38] = 25825
-lookup[39] = 25977
-lookup[40] = 26128
+DIM joined
 
 //******************************************************************************
 // Function and Subroutine definitions
@@ -268,7 +224,7 @@ lookup[40] = 26128
 
 //==============================================================================
 Sub EndianSwap(byref atm)
-    atm = (atm >> 8 & 0xFF) | (atm << 8 & 0xFF00)
+    atm = ((atm >> 8) & 0xFF) | ((atm << 8) & 0xFF00)
 Endsub
 
 Function SwapBytes(v) AS Integer
@@ -361,7 +317,7 @@ FUNCTION ConfigDeviceByBLE()
     rc=BleSvcCommit(1,BleHandleUuid16(0x18EE),hSvc)
     //initialise char, write/read enabled, accept signed writes
     rc=BleCharNew(0x0A,BleHandleUuid16(1),BleAttrMetaData(1,1,20,0,rc),0,0)
-    //commit char initialised above, with initial value "hi" to service 'hSvc'
+    //commit char initialised above, with initial value to service 'hSvc'
     rc=BleCharCommit(hSvc,attr$,hMyChar)
 
     rc=BleScanRptInit(scRpt$)
@@ -373,137 +329,132 @@ FUNCTION ConfigDeviceByBLE()
 ENDFUNC rc
 
 //==============================================================================
-// Read temperature sensor
-//==============================================================================
-Function ReadTemp()
-
-    DIM rawRead
-    DIM tempC
-    DIM localReadings(LOCAL_SAMPLES)        // array of local temperature readings
-    DIM i
-    FOR i=0 TO (LOCAL_SAMPLES-1) STEP 1
-      localReadings[i] = GpioRead(TEMP_SENSOR_PIN)
-    NEXT
-
-    // Bubble sort
-    DIM j
-    DIM k
-    FOR j=0 TO j<(LOCAL_SAMPLES-1) STEP 1
-      FOR k=0 TO k<(LOCAL_SAMPLES-(j+1)) STEP 1
-        IF localReadings[k] > localReadings[k+1] THEN
-          DIM t
-          t = localReadings[k]
-          localReadings[k] = localReadings[k+1]
-          localReadings[k+1] = t
-        ENDIF
-      NEXT
-    NEXT
-
-   // Find median
-   IF LOCAL_SAMPLES % 2 == 0 THEN
-    rawRead = (localReadings[(LOCAL_SAMPLES/2)-1]+localReadings[(LOCAL_SAMPLES/2)])/2
-    ELSE
-    rawRead = localReadings[((LOCAL_SAMPLES-1)/2)]
-   ENDIF
-
-   tempC = (((rawRead * 10)- 7486)*((rawRead *10) + 117331)) / -4722260
-
-Endfunc tempC
-
-//==============================================================================
-// Read ultrasonic sensor
+// Read ultrasonic sensor -- takes median of a number of samples
 //==============================================================================
 Function ReadDistance()
 
-  DIM distanceCM
+  DIM distanceMM
   DIM localReadings(LOCAL_SAMPLES)        // array of local distance readings
   DIM i
   FOR i=0 TO (LOCAL_SAMPLES-1) STEP 1
-    localReadings[i] = GpioRead(DISTANCE_SENSOR_PIN)
-    // XL reading happens at 10-Hz rate.
-    Delay(100)
+    IF MB7060 THEN
+      localReadings[i] = ((GpioRead(DISTANCE_SENSOR_PIN) * 109)) / 10
+    ELSE
+       localReadings[i] = ((GpioRead(DISTANCE_SENSOR_PIN) * 109) * 5) / 100
+    ENDIF
+    IF ENABLE_DEBUG_PRINTS THEN
+		    PRINT "Distance:" ; localReadings[i] ; "\n"
+	  ENDIF
+    // XL reading happens at 1-Hz rate.
+    Delay(1000)
   NEXT
 
   // Bubble sort
-  DIM j
-  DIM k
-  FOR j=0 TO j<(LOCAL_SAMPLES-1) STEP 1
-    FOR k=0 TO k<(LOCAL_SAMPLES-(j+1)) STEP 1
-      IF localReadings[k] > localReadings[k+1] THEN
-        DIM t
-        t = localReadings[k]
-        localReadings[k] = localReadings[k+1]
-        localReadings[k+1] = t
+  DIM j, t
+
+  FOR i=0 TO (LOCAL_SAMPLES-1) STEP 1
+    FOR j=0 TO (LOCAL_SAMPLES-i-1) STEP 1
+      IF (localReadings [j] > localReadings[j+1] ) THEN
+        // Swap Places
+        t = localReadings [j]
+        localReadings[j] = localReadings [j+1]
+        localReadings [j+1] = t
       ENDIF
     NEXT
   NEXT
 
-  // Find median
-  IF LOCAL_SAMPLES % 2 == 0 THEN
-  distanceCM = (localReadings[(LOCAL_SAMPLES/2)-1]+localReadings[(LOCAL_SAMPLES/2)])/2
-  ELSE
-  distanceCM = localReadings[((LOCAL_SAMPLES-1)/2)]
+  IF ENABLE_DEBUG_PRINTS THEN
+    PRINT "Sorted Array: \n"
+    FOR i=0 TO (LOCAL_SAMPLES-1) STEP 1
+      PRINT "Distance:" ; localReadings[i] ; "\n"
+    NEXT
   ENDIF
 
-Endfunc distanceCM
+
+  // Find median
+  IF LOCAL_SAMPLES % 2 == 0 THEN
+  distanceMM = (localReadings[(LOCAL_SAMPLES/2)-1]+localReadings[(LOCAL_SAMPLES/2)])/2
+  ELSE
+  distanceMM = localReadings[((LOCAL_SAMPLES-1)/2)]
+  ENDIF
+  IF ENABLE_DEBUG_PRINTS THEN
+		    PRINT "Median Distance:" ; distanceMM ; "\n"
+	ENDIF
+  IF distanceToFloor != 0 THEN
+    distanceMM = distanceToFloor - distanceMM
+  ENDIF
+Endfunc distanceMM
 
 //==============================================================================
 // Transmit average river height over LoRaWAN network
 //==============================================================================
 Function LoraPost() AS Integer
-    IF (okToTx == 1) THEN
-      //There is available duty cycle
-      DIM rawDistType$, rawDistVal$, tempType$, tempVal$, compDistType$, compDistVal$, txData$
-      DIM atm, theoreticalMax, actualMax
-
+    
       //Data format
-      rawDistType$="\02\02"
-      tempType$="\02\02"
-      compDistType$="\02\02"
+      DIM atm, theoreticalMax, actualMax
+      DIM distanceVal$, distance, txData$
 
-      DIM temperatureC
-      DIM rawDistanceCM
-      DIM tempCompensatedDistance
-
-      temperatureC = ReadTemp()
-      rawDistanceCM = ReadDistance()
+      distance = ReadDistance() 
       rc = gpiosetfunc(ENABLE_SENSORS,2,0)  // Puts sensors back into 'off state'
 
-      tempCompensatedDistance = (rawDistanceCM*(lookup[(temperatureC/5)+10] + (35*(temperatureC%5))))/20000
+      
+      IF ENABLE_DEBUG_PRINTS THEN
+		    PRINT "Result of distance:" ; distance  ; "\n"
+	    ENDIF
 
-      // Create payload
-      EndianSwap(rawDistanceCM)
-      rc = BleEncode16(rawDistVal$,rawDistanceCM,0)
+      distanceVal$ = ""
+      EndianSwap(distance)
 
-      EndianSwap(temperatureC)
-      rc = BleEncode16(tempVal$,temperatureC,0)
+      IF ENABLE_DEBUG_PRINTS THEN
+		    PRINT "Result of Endian Swap:" ; distance ; "\n"
+	    ENDIF
 
-      EndianSwap(tempCompensatedDistance)
-      rc = BleEncode16(compDistVal$,tempCompensatedDistance,0)
+      rc=bleencode16(distanceVal$,distance,0)
 
-      txData$ = rawDistType$ + rawDistVal$ + tempType$ + tempVal$ + compDistType$ + compDistVal$
+      IF ENABLE_DEBUG_PRINTS THEN
+		    PRINT "Result of bleencode16:" ; strgetchr(distanceVal$,0)  ; "\n"
+        PRINT "Result of bleencode16:" ; strgetchr(distanceVal$,1)  ; "\n"
+	    ENDIF
 
-      //Check the size of data is within maximum payload size
-      rc = LoramacQueryTxPossible(strlen(txData$), theoreticalMax, actualMax)
-      IF (rc == 0) THEN
-          //Current data rate can handle the outbound data size
-          rc = LORAMACTxData(3, txData$, 0)
-      ELSE
-          // Data payload is too large for current data rate"
-          //Increase data rate by one
-          rc = LORAMACGetOption(LORAMAC_OPT_DATA_RATE, str$)
-          DIM dr : dr = StrValDec(str$)
-          IF (dr <= 4) then
-              dr = dr + 1
-              sprint #str$, dr
-              // Raising data rate for higher max payload
-          ENDIF
-          rc = LORAMACSetOption(LORAMAC_OPT_DATA_RATE, str$)
-      ENDIF
+      txData$ = distanceVal$
+
+      IF ENABLE_DEBUG_PRINTS THEN
+		    PRINT "Transmit Payload:" ; txData$ ; "\n"
+	    ENDIF
+
+    IF (joined == 1) THEN
+      IF (okToTx == 1) THEN 
+        //There is available duty cycle
+        //Check the size of data is within maximum payload size
+        rc = LoramacQueryTxPossible(strlen(txData$), theoreticalMax, actualMax)
+        IF (rc == 0) THEN
+            //Current data rate can handle the outbound data size
+              IF ENABLE_DEBUG_PRINTS THEN
+                PRINT "Sending Payload \n"
+              ENDIF
+              rc = LORAMACTxData(1, txData$, 0)
+        ELSE
+            // Data payload is too large for current data rate"
+            //Increase data rate by one
+            IF ENABLE_DEBUG_PRINTS THEN
+                PRINT "Payload to large, increasing data rate \n"
+            ENDIF
+            rc = LORAMACGetOption(LORAMAC_OPT_DATA_RATE, str$)
+            DIM dr : dr = StrValDec(str$)
+            IF (dr <= 4) then
+                dr = dr + 1
+                sprint #str$, dr
+                // Raising data rate for higher max payload
+            ENDIF
+            rc = LORAMACSetOption(LORAMAC_OPT_DATA_RATE, str$)
+        ENDIF
     ELSE
         // There is no available duty cycle
         okToTx = 0  //Will become 1 when EVLORAMACNEXTTX is triggered
     ENDIF
+  ELSE
+      rc = LORAMACJoin(LORAMAC_JOIN_BY_REQUEST)
+  ENDIF
 Endfunc 1
 
 //******************************************************************************
@@ -511,14 +462,17 @@ Endfunc 1
 //******************************************************************************
 
 //==============================================================================
-// This handler is called when it is time to take a distance measurement
+// This handler is called when it is time to take a measurement. 
 //==============================================================================
 
 Function EnableSensors() AS Integer
   // Turn on sensors
+  IF ENABLE_DEBUG_PRINTS THEN
+	  PRINT "Enabling sensors \n"
+	ENDIF
   gpiowrite(ENABLE_SENSORS,1)
-  // Start a 200 millisecond timer to allow things to stabilize
-  TimerStart(1,200,0)
+  // Start a 5000 millisecond timer to allow things to stabilize
+  TimerStart(1,5000,0)
 Endfunc 1
 
 //==============================================================================
@@ -587,25 +541,33 @@ Endfunc 1
 // This handler is called when the LoRa Join procedure starts
 //==============================================================================
 Function HandlerLoRaJoining() AS Integer
+  IF ENABLE_DEBUG_PRINTS THEN
+	    PRINT "Joining \n"
+	ENDIF
 Endfunc 1
 
 //==============================================================================
 // This handler is called when there is a LoRa Join Success Complete event
 //==============================================================================
 Function HandlerLoRaJoined() AS Integer
-    //Change data rate to DR2 to allow bigger payload
-    str$ = "2"
-    rc = LORAMACSetOption(LORAMAC_OPT_DATA_RATE, str$)
-    IF (AUTO_JOIN == 1) THEN
-        // Sample sensors every minute
-        TimerStart(0, 60000, 1)
-    ENDIF
+    IF ENABLE_DEBUG_PRINTS THEN
+	    PRINT "Network Joined \n"
+	  ENDIF
+    //Overide the lorawan spreadfactor to SF10 (data rate 2)
+	  str$ = "2"
+	  rc = LORAMACSetOption(LORAMAC_OPT_DATA_RATE, str$)
+    // Enable ADR
+    str$ = "1"
+    rc = LoramacSetOption(LORAMAC_OPT_ADR_ENABLE,str$)
+    joined = 1
+    TimerStart(0, 60000, 1)
 Endfunc 1
 
 //==============================================================================
 // This handler is called when there is a LoRa Join Fail event
 //==============================================================================
 Function HandlerLoRaJoinFailed() AS Integer
+ joined = 0
 Endfunc 1
 
 //==============================================================================
@@ -657,6 +619,9 @@ Endfunc 1
 // This handler is called when config via BLE times out
 //==============================================================================
 Function ConfigViaBleTimedOut() AS Integer
+    IF ENABLE_DEBUG_PRINTS THEN
+		  PRINT "Config by BLE period ends, switching to eddystone\n"
+	  ENDIF
     IF bleConnectionState == 0 THEN
       TimerCancel(2)
       CloseConnections()
@@ -702,16 +667,17 @@ Sub Initialise()
     rc = gpiosetfunc(ENABLE_SENSORS,2,0)  // Puts sensors in 'off state'
     uartclose()                           // Closes the UART
 
-    //
     //Set up 10bit ADC with 1/3 prescaler FOR distance and temperature sensor
     rc = gpiosetfunc(DISTANCE_SENSOR_PIN,3,0x13)
-    rc = gpiosetfunc(TEMP_SENSOR_PIN,3,0x13)
 
     // Attempt to read sensor distance to floor bed from memory
     DIM distanceAsString$
     rc = NvRecordGetEx(1,distanceAsString$,"0")
     distanceToFloor = StrValDec(distanceAsString$)
 
+    IF ENABLE_DEBUG_PRINTS THEN
+	    PRINT "Start BLE adverts for config \n"
+	  ENDIF
     // Start BLE service to allow device to be remotely configured
     IF ConfigDeviceByBLE()==0 THEN
       TimerStart(2, 60000, 1)
@@ -738,11 +704,21 @@ Sub Initialise()
         transmitInterval = 15
     ENDSELECT
 
+    IF ENABLE_DEBUG_PRINTS THEN
+	    PRINT "Transmit Interval is: "; transmitInterval ; " minutes \n"
+	  ENDIF
+
+    joined = 0
     //Automatically join the LoRaWAN network if set
     IF (AUTO_JOIN == 1) THEN
         rc = LORAMACJoin(JOIN_TYPE)
+        IF rc != 0 THEN
+          IF ENABLE_DEBUG_PRINTS THEN
+	          PRINT "Join Error \n"
+            STOP
+	        ENDIF
+        ENDIF
     ENDIF
-
 
 Endsub
 
